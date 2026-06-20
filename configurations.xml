@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OfficeConfigurations>
+
+  <OdtDownload Url="https://download.microsoft.com/download/6c1eeb25-cf8b-41d9-8d0d-cc1dbc032140/officedeploymenttool_20026-20112.exe" />
+
+  <!-- Очікуваний розмір офлайн-пакету (байти) для розрахунку відсотків -->
+  <DownloadProfile ExpectedBytes="2200000000" />
+
+  <!-- configuration — базова конфігурація Office 2021 Pro Plus -->
+  <Configuration id="configuration">
+    <Add OfficeClientEdition="64" Channel="PerpetualVL2021">
+      <Product ID="ProPlus2021Volume">
+        <Language ID="uk-ua" />
+        <ExcludeApp ID="Lync" />
+        <ExcludeApp ID="Teams" />
+      </Product>
+    </Add>
+    <Display Level="None" AcceptEULA="TRUE" />
+  </Configuration>
+
+  <!-- configuration-download.xml — завантаження офлайн-пакету -->
+  <Configuration id="configuration-download">
+    <Add OfficeClientEdition="64" Channel="PerpetualVL2021">
+      <Product ID="ProPlus2021Volume">
+        <Language ID="uk-ua" />
+        <ExcludeApp ID="Lync" />
+        <ExcludeApp ID="Teams" />
+      </Product>
+    </Add>
+    <Display Level="None" AcceptEULA="TRUE" />
+  </Configuration>
+
+  <!-- configuration-install — зразок (реальний файл генерується скриптом) -->
+  <Configuration id="configuration-install">
+    <Add OfficeClientEdition="64" Channel="PerpetualVL2021">
+      <Product ID="ProPlus2021Volume">
+        <Language ID="uk-ua" />
+        <ExcludeApp ID="Lync" />
+        <ExcludeApp ID="Teams" />
+      </Product>
+    </Add>
+    <Display Level="Full" AcceptEULA="TRUE" />
+  </Configuration>
+
+  <!-- configuration-remove.xml — повне видалення Office -->
+  <Configuration id="configuration-remove">
+    <Remove All="TRUE" />
+    <Display Level="Full" AcceptEULA="TRUE" />
+  </Configuration>
+
+</OfficeConfigurations>
