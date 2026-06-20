@@ -1,5 +1,8 @@
 # Office 2021 Pro Plus — Offline Installer (ODT)
 
+<img width="544" height="558" alt="image" src="https://github.com/user-attachments/assets/669ff73d-b16b-4279-8d49-bf6ebbcff65f" />
+
+
 Офлайн-інсталятор Microsoft Office на базі **Office Deployment Tool (ODT)**. Скрипт дозволяє:
 
 - завантажити `setup.exe` (ODT) з серверів Microsoft;
