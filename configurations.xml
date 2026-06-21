@@ -46,10 +46,11 @@
     <Display Level="None" AcceptEULA="TRUE" />
   </Configuration>
 
-  <!-- configuration-remove.xml — повне видалення Office -->
+  <!-- configuration-remove.xml — повне видалення Office (генерується скриптом) -->
   <Configuration id="configuration-remove">
     <Remove All="TRUE" />
-    <Display Level="Full" AcceptEULA="TRUE" />
+    <Updates Enabled="FALSE" />
+    <Display Level="None" AcceptEULA="TRUE" />
   </Configuration>
 
 </OfficeConfigurations>

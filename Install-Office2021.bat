@@ -354,20 +354,17 @@ choice /C YN0 /N /M "  Y=так  N=ні  0=меню: "
 if errorlevel 3 goto :menu
 if errorlevel 2 goto :menu
 echo.
-echo  [Крок 2/3] Підготовка конфігурації видалення...
-powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\Office-Installer.ps1" -Command PrepareConfig -InstallDir "%ROOT_DIR%" -Mode Uninstall
-echo  [OK] configuration-remove.xml створено
-echo.
-echo  [Крок 3/3] Видалення Office...
+echo  [Крок 2/3] Видалення Office...
+echo    Тихий режим — прогрес у цьому вікні.
 echo    Початок: %TIME%
 echo    --------------------------------------------------------
 call :check_setup_running
-"%ROOT_DIR%\setup.exe" /configure "%ROOT_DIR%\configuration-remove.xml"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\Office-Installer.ps1" -Command Uninstall -InstallDir "%ROOT_DIR%"
 set "EXIT_CODE=%ERRORLEVEL%"
 echo    --------------------------------------------------------
 echo    Завершено: %TIME%  ^(код: %EXIT_CODE%^)
 echo.
-echo  Перевірка результату...
+echo  [Крок 3/3] Перевірка результату...
 powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\Office-Installer.ps1" -Command VerifyRemoved -SetupExitCode %EXIT_CODE%
 set "VERIFY_CODE=%ERRORLEVEL%"
 echo.

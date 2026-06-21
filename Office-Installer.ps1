@@ -4,7 +4,7 @@
 #         Verify-OfficeInstall, Verify-OfficeRemoved
 
 param(
-    [ValidateSet('PrepareConfig', 'PrepareInstallConfig', 'Download', 'DownloadOdt', 'Install', 'VerifyInstall', 'VerifyRemoved', 'ResolvePaths', 'GetInstalledOffice', 'CheckTeamsSkype', 'RemoveTeamsSkype')]
+    [ValidateSet('PrepareConfig', 'PrepareInstallConfig', 'Download', 'DownloadOdt', 'Install', 'Uninstall', 'VerifyInstall', 'VerifyRemoved', 'ResolvePaths', 'GetInstalledOffice', 'CheckTeamsSkype', 'RemoveTeamsSkype')]
     [string]$Command = 'Install',
 
     [string]$InstallDir,
@@ -172,6 +172,27 @@ function Get-InstallDisplayLevel {
     return 'None'
 }
 
+function Add-OdtOfflineCommonOptions {
+    param(
+        [System.Xml.XmlDocument]$Doc,
+        [System.Xml.XmlElement]$Cfg
+    )
+
+    $updates = $Doc.CreateElement('Updates')
+    [void]$updates.SetAttribute('Enabled', 'FALSE')
+    [void]$Cfg.AppendChild($updates)
+
+    foreach ($prop in @(
+            @{ Name = 'FORCEAPPSHUTDOWN'; Value = 'TRUE' },
+            @{ Name = 'SharedComputerLicensing'; Value = '0' }
+        )) {
+        $property = $Doc.CreateElement('Property')
+        [void]$property.SetAttribute('Name', $prop.Name)
+        [void]$property.SetAttribute('Value', $prop.Value)
+        [void]$Cfg.AppendChild($property)
+    }
+}
+
 function Add-OdtOfflineInstallOptions {
     param(
         [System.Xml.XmlDocument]$Doc,
@@ -187,19 +208,21 @@ function Add-OdtOfflineInstallOptions {
         [void]$Add.SetAttribute('Version', $Version)
     }
 
-    $updates = $Doc.CreateElement('Updates')
-    [void]$updates.SetAttribute('Enabled', 'FALSE')
-    [void]$Cfg.AppendChild($updates)
+    Add-OdtOfflineCommonOptions -Doc $Doc -Cfg $Cfg
+}
 
-    foreach ($prop in @(
-            @{ Name = 'FORCEAPPSHUTDOWN'; Value = 'TRUE' },
-            @{ Name = 'SharedComputerLicensing'; Value = '0' }
-        )) {
-        $property = $Doc.CreateElement('Property')
-        [void]$property.SetAttribute('Name', $prop.Name)
-        [void]$property.SetAttribute('Value', $prop.Value)
-        [void]$Cfg.AppendChild($property)
-    }
+function Add-OdtOfflineRemoveOptions {
+    param(
+        [System.Xml.XmlDocument]$Doc,
+        [System.Xml.XmlElement]$Cfg,
+        [System.Xml.XmlElement]$Remove,
+        [string]$InstallDir
+    )
+
+    $sourcePath = (Resolve-Path -LiteralPath $InstallDir).Path
+    [void]$Remove.SetAttribute('SourcePath', $sourcePath)
+
+    Add-OdtOfflineCommonOptions -Doc $Doc -Cfg $Cfg
 }
 
 function Add-OdtInstallLoggingNode {
@@ -360,12 +383,18 @@ function Invoke-PrepareOfficeConfig {
             $fileName = 'configuration-download.xml'
         }
         'Uninstall' {
+            $displayLevel = Get-InstallDisplayLevel -InstallDir $InstallDir
+            $logDir = Join-Path $InstallDir 'Logs'
+
             $remove = $doc.CreateElement('Remove')
             [void]$remove.SetAttribute('All', 'TRUE')
+
+            Add-OdtOfflineRemoveOptions -Doc $doc -Cfg $cfg -Remove $remove -InstallDir $InstallDir
+            Add-OdtInstallLoggingNode -Doc $doc -Cfg $cfg -LogDir $logDir
             [void]$cfg.AppendChild($remove)
 
             $display = $doc.CreateElement('Display')
-            [void]$display.SetAttribute('Level', 'Full')
+            [void]$display.SetAttribute('Level', $displayLevel)
             [void]$display.SetAttribute('AcceptEULA', 'TRUE')
             [void]$cfg.AppendChild($display)
 
@@ -842,17 +871,18 @@ function Invoke-DownloadOfficePackage {
 
     $startTime = Get-Date
     $logDir = Get-OfficeInstallerLogDirectory -InstallDir $InstallDir
+    $workDir = Get-OfficeSetupWorkDirectory -LogDirectory $logDir
 
     $job = Start-Job -ScriptBlock {
-        param($SetupPath, $ConfigPath, $WorkDir, $LogDir)
+        param($SetupPath, $ConfigPath, $WorkDir, $OdtWorkDir)
         Set-Location $WorkDir
-        if ($LogDir) {
-            $env:TEMP = $LogDir
-            $env:TMP = $LogDir
+        if ($OdtWorkDir) {
+            $env:TEMP = $OdtWorkDir
+            $env:TMP = $OdtWorkDir
         }
         & $SetupPath /download $ConfigPath
         return $LASTEXITCODE
-    } -ArgumentList $setup, $config, $InstallDir, $logDir
+    } -ArgumentList $setup, $config, $InstallDir, $workDir
 
     $lastSize = 0L
     $lastTick = Get-Date
@@ -997,6 +1027,7 @@ function Invoke-InstallOffice2021 {
         -ConfigPath $configPath `
         -InstallDir $root `
         -ShowTerminalProgress:$showTerminalProgress `
+        -SetupOperation Install `
         -Description $(if ($setupMode -eq 'Reinstall') { 'Перевстановлення Office з офлайн-пакету' } else { 'Встановлення Office з офлайн-пакету' })
 
     Write-Host ""
@@ -1006,6 +1037,78 @@ function Invoke-InstallOffice2021 {
     }
 
     Write-Host "Помилка встановлення. Код: $exitCode" -ForegroundColor Red
+    $help = Get-OfficeSetupErrorHelp -ExitCode $exitCode
+    if ($help) {
+        Write-Host $help -ForegroundColor Yellow
+    } else {
+        Write-Host "Перевірте лог у папці Logs" -ForegroundColor Yellow
+    }
+    exit 1
+}
+
+function Invoke-UninstallOffice {
+    Initialize-UkrainianConsole
+    $ErrorActionPreference = 'Stop'
+
+    if ($InstallDir) {
+        $root = (Resolve-Path -LiteralPath $InstallDir).Path
+    } else {
+        $paths = Resolve-OfficePaths -BasePath $PSScriptRoot
+        $root = $paths.RootDir
+    }
+
+    if (-not (Test-Path -LiteralPath (Join-Path $root 'setup.exe'))) {
+        Write-Host "setup.exe не знайдено. Спочатку виконайте пункт [1] у меню." -ForegroundColor Red
+        exit 1
+    }
+
+    $officeItems = @(Get-InstalledOfficeInfo)
+    if ($officeItems.Count -eq 0) {
+        Write-Host ""
+        Write-Host "  [i] Office у системі не знайдено — видаляти нічого." -ForegroundColor Yellow
+        exit 0
+    }
+
+    Set-Location $root
+
+    Write-Host ""
+    Write-Host "  [i] Підготовка до видалення..." -ForegroundColor Cyan
+    Stop-OfficeSetupProcesses
+    Start-OfficeClickToRunService | Out-Null
+
+    Invoke-PrepareOfficeConfig -InstallDir $root -Mode Uninstall | Out-Null
+
+    $displayLevel = Get-InstallDisplayLevel -InstallDir $root
+    $configPath = Join-Path $root 'configuration-remove.xml'
+    $setupPath = Join-Path $root 'setup.exe'
+    $showTerminalProgress = ($displayLevel -eq 'None')
+
+    Write-Host ""
+    Write-Host "  Видалення Microsoft Office..." -ForegroundColor Cyan
+    foreach ($item in $officeItems) {
+        Write-Host "  Знайдено: $($item.DisplayName) v$($item.DisplayVersion)" -ForegroundColor Gray
+    }
+    Write-Host "  Режим:   без вікна Microsoft, без оновлень з інтернету" -ForegroundColor Gray
+    if ($showTerminalProgress) {
+        Write-Host "  UI:      прихований — прогрес у цьому вікні" -ForegroundColor Gray
+    }
+    Write-Host ""
+
+    $exitCode = Invoke-SetupConfigureWithProgress `
+        -SetupPath $setupPath `
+        -ConfigPath $configPath `
+        -InstallDir $root `
+        -ShowTerminalProgress:$showTerminalProgress `
+        -SetupOperation Uninstall `
+        -Description 'Видалення Office'
+
+    Write-Host ""
+    if ($exitCode -eq 0 -or $exitCode -eq 3010) {
+        Write-Host "Office видалено успішно!" -ForegroundColor Green
+        exit 0
+    }
+
+    Write-Host "Помилка видалення. Код: $exitCode" -ForegroundColor Red
     $help = Get-OfficeSetupErrorHelp -ExitCode $exitCode
     if ($help) {
         Write-Host $help -ForegroundColor Yellow
@@ -1323,6 +1426,10 @@ function Invoke-VerifyOfficeInstall {
     }
 
     if ($SetupExitCode -ne 0) {
+        if ($officeEntry -and $installedApps.Count -ge 3) {
+            Write-StatusLine "OK" "Office встановлено (setup.exe: код $SetupExitCode, у логах: успіх)" "Green"
+            exit 0
+        }
         if ($officeEntry) {
             Write-StatusLine "!" "setup.exe повернув код $SetupExitCode (в системі: $($officeEntry.Edition) v$($officeEntry.DisplayVersion))" "Yellow"
             exit 3
@@ -1469,13 +1576,35 @@ function Write-ProgressLine {
     Write-Host ("`r{0,-90}" -f $line) -NoNewline
 }
 
+function Test-OfficeSetupLogLineIsRemoval {
+    param(
+        [string]$Line,
+        [ValidateSet('Install', 'Uninstall', 'RemoveApps', 'Unknown')]
+        [string]$SetupOperation = 'Unknown'
+    )
+
+    if ($SetupOperation -in @('Uninstall', 'RemoveApps')) { return $true }
+
+    if ($Line -match '(?i)configuration-remove|ODTUninstall|UNINSTALLCENTENNIAL|ProductsToRemove|"Scenario"\s*:\s*"REMOVE"|ScenarioSubType.*Uninstall|TaskType.*UNINSTALL|ProductsToRemove') {
+        return $true
+    }
+
+    return $false
+}
+
 function Convert-OfficeSetupLogLine {
-    param([string]$Line)
+    param(
+        [string]$Line,
+        [ValidateSet('Install', 'Uninstall', 'RemoveApps', 'Unknown')]
+        [string]$SetupOperation = 'Unknown'
+    )
 
     if ([string]::IsNullOrWhiteSpace($Line)) { return $null }
 
     $line = $Line.Trim()
     if ($line.Length -lt 8) { return $null }
+
+    $isRemoval = Test-OfficeSetupLogLineIsRemoval -Line $line -SetupOperation $SetupOperation
 
     if ($line -match '(?i)Telemetry Event|ActivityEnded|SendEvent|DroppedAggregatedActivity|General Telemetry') {
         return $null
@@ -1500,10 +1629,24 @@ function Convert-OfficeSetupLogLine {
     if ($line -match 'total progress is now (\d+)\.') {
         $pct = [int]$Matches[1]
         if ($pct -ge 0 -and $pct -le 100) {
+            $label = if ($isRemoval) { 'Видалення' } else { 'Прогрес' }
             return [PSCustomObject]@{
                 Kind    = 'Percent'
-                Text    = "Прогрес: $pct%"
+                Text    = "$label`: $pct%"
                 Percent = $pct
+            }
+        }
+    }
+
+    if ($line -match 'splash progress is now (\d+)\.') {
+        $pct = [int]$Matches[1]
+        if ($pct -ge 0 -and $pct -le 120) {
+            $norm = [Math]::Min(100, [int][Math]::Round($pct * 100.0 / 120.0))
+            $label = if ($isRemoval) { 'Видалення' } else { 'Прогрес' }
+            return [PSCustomObject]@{
+                Kind    = 'Percent'
+                Text    = "$label`: $norm%"
+                Percent = $norm
             }
         }
     }
@@ -1516,37 +1659,75 @@ function Convert-OfficeSetupLogLine {
         if ($line -match '"PercentComplete"\s*:\s*(\d{1,3})') {
             $pct = [int]$Matches[1]
             if ($pct -ge 0 -and $pct -le 100) {
+                $label = if ($isRemoval) { 'Видалення' } else { 'Прогрес' }
                 return [PSCustomObject]@{
                     Kind    = 'Percent'
-                    Text    = "Прогрес: $pct%"
+                    Text    = "$label`: $pct%"
                     Percent = $pct
                 }
             }
         }
 
         if ($line -match '(?i)"message"\s*:\s*"(Downloading|Installing|Applying|Copying|Removing|Updating)[^"]*"') {
-            return [PSCustomObject]@{ Kind = 'Stage'; Text = "$($Matches[1])..." }
+            $stage = $Matches[1]
+            if ($isRemoval -and $stage -match '(?i)^Installing$') { $stage = 'Removing' }
+            $uk = switch -Regex ($stage) {
+                '^Downloading$' { 'Завантаження' }
+                '^Installing$'  { if ($isRemoval) { 'Видалення' } else { 'Встановлення' } }
+                '^Applying$'    { 'Застосування' }
+                '^Copying$'     { 'Копіювання' }
+                '^Removing$'    { 'Видалення' }
+                '^Updating$'    { 'Оновлення' }
+                default         { $stage }
+            }
+            return [PSCustomObject]@{ Kind = 'Stage'; Text = "$uk..." }
         }
 
         if ($line -match '(?i)C2R::Setup::') {
-            if ($line -match '(?i)download') { return [PSCustomObject]@{ Kind = 'Stage'; Text = 'Підготовка компонентів...' } }
-            if ($line -match '(?i)install|configure') { return [PSCustomObject]@{ Kind = 'Stage'; Text = 'Встановлення компонентів...' } }
-            if ($line -match '(?i)remove|uninstall') { return [PSCustomObject]@{ Kind = 'Stage'; Text = 'Видалення попередньої версії...' } }
-            if ($line -match '(?i)register') { return [PSCustomObject]@{ Kind = 'Stage'; Text = 'Реєстрація Office...' } }
-        }
-
-        foreach ($app in @('Word', 'Excel', 'Outlook', 'PowerPoint', 'Access', 'Publisher', 'OneNote')) {
-            if ($line -match "\b$app\b" -and $line -match '(?i)install|package|stream|app') {
-                return [PSCustomObject]@{ Kind = 'App'; Text = "Встановлення: $app" }
+            if ($line -match '(?i)remove|uninstall') {
+                return [PSCustomObject]@{ Kind = 'Stage'; Text = 'Видалення Office...' }
+            }
+            if ($line -match '(?i)download') {
+                return [PSCustomObject]@{ Kind = 'Stage'; Text = 'Підготовка компонентів...' }
+            }
+            if ($line -match '(?i)\bconfigure\b|\binstall\b') {
+                $text = if ($isRemoval) { 'Видалення компонентів...' } else { 'Встановлення компонентів...' }
+                return [PSCustomObject]@{ Kind = 'Stage'; Text = $text }
+            }
+            if ($line -match '(?i)register') {
+                return [PSCustomObject]@{ Kind = 'Stage'; Text = 'Реєстрація Office...' }
             }
         }
 
+        foreach ($app in @('Word', 'Excel', 'Outlook', 'PowerPoint', 'Access', 'Publisher', 'OneNote')) {
+            if ($line -match "\b$app\b" -and $line -match '(?i)package|stream|app|remove|uninstall') {
+                $verb = if ($isRemoval) { 'Видалення' } else { 'Встановлення' }
+                return [PSCustomObject]@{ Kind = 'App'; Text = "$verb`: $app" }
+            }
+        }
+
+        if ($line -match '(?i)"Scenario"\s*:\s*"REMOVE"|ODTUninstall|UNINSTALLCENTENNIAL|ProductsToRemove') {
+            return [PSCustomObject]@{ Kind = 'Stage'; Text = 'Видалення Office...' }
+        }
+
         if ($line -match '(?i)Bootstrapper Finished') {
-            return [PSCustomObject]@{ Kind = 'Stage'; Text = 'Завершення інсталяції...' }
+            return [PSCustomObject]@{ Kind = 'Stage'; Text = 'Завершення...' }
         }
     }
 
     return $null
+}
+
+function Get-OfficeSetupLogPriority {
+    param([string]$Name)
+
+    if ($Name -match '^(?i)PPO-') { return 300 }
+    if ($Name -match '^(?i)DESKTOP-') { return 200 }
+    if ($Name -match '^(?i)OfficeSetup_') { return 150 }
+    if ($Name -match '(?i)officeclicktorun|aria-debug') { return 10 }
+    if ($Name -match '\.log$') { return 50 }
+
+    return 0
 }
 
 function Get-OfficeSetupLogCandidates {
@@ -1562,11 +1743,15 @@ function Get-OfficeSetupLogCandidates {
         $files += Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
             Where-Object {
                 $_.LastWriteTime -ge $NotBefore.AddMinutes(-1) -and
-                ($_.Extension -eq '.log' -or $_.Name -match '(?i)setup|office|c2r')
+                ($_.Extension -eq '.log' -or $_.Name -match '(?i)setup|office|c2r|desktop|ppo')
             }
     }
 
-    return @($files | Sort-Object LastWriteTime -Descending)
+    return @(
+        $files |
+            Sort-Object @{ Expression = { Get-OfficeSetupLogPriority -Name $_.Name }; Descending = $true },
+                      LastWriteTime -Descending
+    )
 }
 
 function Get-ActiveOfficeSetupLogFile {
@@ -1603,13 +1788,35 @@ function Get-OfficeSetupExitCodeFromLog {
     if (-not $LogPath -or -not (Test-Path -LiteralPath $LogPath)) { return $null }
 
     try {
-        $lines = Get-Content -LiteralPath $LogPath -Tail 200 -ErrorAction Stop
+        $lines = Get-Content -LiteralPath $LogPath -Tail 300 -ErrorAction Stop
     } catch {
         return $null
     }
 
     for ($i = $lines.Count - 1; $i -ge 0; $i--) {
         $line = $lines[$i]
+        if ($line -match 'Bootstrapper Finished.*?ExitCode\\":\\"(\d+)\\"') {
+            return [int]$Matches[1]
+        }
+        if ($line -match 'Bootstrapper Finished.*?"ExitCode"\s*:\s*"(\d+)"') {
+            return [int]$Matches[1]
+        }
+        if ($line -match '(?i)UniversalBootstrapper\.Application3.*?"Data\.ExitCode"\s*:\s*(\d+)') {
+            return [int]$Matches[1]
+        }
+        if ($line -match '(?i)Main:\s+returned:\s+(\d+)') {
+            return [int]$Matches[1]
+        }
+        if ($line -match '(?i)Exit with error code\s+(\d+)') {
+            return [int]$Matches[1]
+        }
+    }
+
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        $line = $lines[$i]
+        if ($line -match 'ExitCode\\":\\"(\d+)\\"') {
+            return [int]$Matches[1]
+        }
         if ($line -match '"ExitCode"\s*:\s*"(\d+)"') {
             return [int]$Matches[1]
         }
@@ -1617,6 +1824,20 @@ function Get-OfficeSetupExitCodeFromLog {
             $code = [int]$Matches[1]
             if ($code -ne 0) { return $code }
         }
+    }
+
+    return $null
+}
+
+function Get-OfficeSetupExitCodeFromLogs {
+    param(
+        [string[]]$SearchPaths,
+        [DateTime]$NotBefore
+    )
+
+    foreach ($file in (Get-OfficeSetupLogCandidates -SearchPaths $SearchPaths -NotBefore $NotBefore)) {
+        $code = Get-OfficeSetupExitCodeFromLog -LogPath $file.FullName
+        if ($null -ne $code) { return $code }
     }
 
     return $null
@@ -1727,24 +1948,6 @@ function Start-OfficeClickToRunService {
     return ($svc.Status -eq 'Running')
 }
 
-function Set-OdtConfigDisplayLevel {
-    param(
-        [string]$ConfigPath,
-        [string]$Level
-    )
-
-    if (-not (Test-Path -LiteralPath $ConfigPath)) { return }
-
-    $doc = New-Object System.Xml.XmlDocument
-    $doc.PreserveWhitespace = $true
-    $doc.Load($ConfigPath)
-    $display = $doc.SelectSingleNode('/Configuration/Display')
-    if (-not $display) { return }
-
-    [void]$display.SetAttribute('Level', $Level)
-    $doc.Save($ConfigPath)
-}
-
 function Invoke-CleanupPartialOfficeInstall {
     param([string]$InstallDir)
 
@@ -1756,7 +1959,6 @@ function Invoke-CleanupPartialOfficeInstall {
 
     Invoke-PrepareOfficeConfig -InstallDir $InstallDir -Mode Uninstall | Out-Null
     $configPath = Join-Path $InstallDir 'configuration-remove.xml'
-    Set-OdtConfigDisplayLevel -ConfigPath $configPath -Level 'None'
 
     Write-Host "  [i] Видалення залишків незавершеного встановлення..." -ForegroundColor Yellow
     Write-Host "      (тихо, без вікна Microsoft)" -ForegroundColor DarkGray
@@ -1771,7 +1973,8 @@ function Invoke-CleanupPartialOfficeInstall {
             -Process $proc `
             -LogDirectory $logDir `
             -StartedAt $startedAt `
-            -ShowProgress:$false
+            -ShowProgress:$false `
+            -SetupOperation Uninstall
     } finally {
         Restore-OfficeSetupEnvironment -State $envState
         if ($logDir) {
@@ -1886,7 +2089,7 @@ function Sync-OfficeSetupLogsToDirectory {
         New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
     }
 
-    $patterns = @('PPO-*.log', 'officeclicktorun*.log', 'aria-debug*.log')
+    $patterns = @('PPO-*.log', 'DESKTOP-*.log', 'officeclicktorun*.log', 'aria-debug*.log')
     $synced = New-Object System.Collections.Generic.List[string]
     $cutoff = $NotBefore.AddMinutes(-2)
 
@@ -1955,6 +2158,19 @@ function Write-OfficeSetupLogSummary {
     }
 }
 
+function Get-OfficeSetupWorkDirectory {
+    param([string]$LogDirectory)
+
+    if (-not $LogDirectory) { return $null }
+
+    $workDir = Join-Path $LogDirectory '_odt_work'
+    if (-not (Test-Path -LiteralPath $workDir)) {
+        New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+    }
+
+    return (Resolve-Path -LiteralPath $workDir).Path
+}
+
 function Use-OfficeSetupLogDirectory {
     param([string]$LogDirectory)
 
@@ -1964,8 +2180,11 @@ function Use-OfficeSetupLogDirectory {
     }
 
     if ($LogDirectory) {
-        $env:TEMP = $LogDirectory
-        $env:TMP = $LogDirectory
+        $workDir = Get-OfficeSetupWorkDirectory -LogDirectory $LogDirectory
+        if ($workDir) {
+            $env:TEMP = $workDir
+            $env:TMP = $workDir
+        }
     }
 
     return $state
@@ -1982,7 +2201,9 @@ function Restore-OfficeSetupEnvironment {
 function Resolve-ProcessExitCode {
     param(
         [System.Diagnostics.Process]$Process,
-        [string]$LogPath
+        [string]$LogPath,
+        [string[]]$SearchPaths,
+        [DateTime]$NotBefore
     )
 
     if ($Process) {
@@ -1991,14 +2212,27 @@ function Resolve-ProcessExitCode {
                 $Process.WaitForExit()
             }
             $Process.Refresh()
+        } catch { }
+    }
+
+    $fromLog = $null
+    if ($SearchPaths -and $NotBefore) {
+        $fromLog = Get-OfficeSetupExitCodeFromLogs -SearchPaths $SearchPaths -NotBefore $NotBefore
+    }
+    if ($null -eq $fromLog -and $LogPath) {
+        $fromLog = Get-OfficeSetupExitCodeFromLog -LogPath $LogPath
+    }
+
+    if ($null -ne $fromLog) { return [int]$fromLog }
+
+    if ($Process) {
+        try {
+            $Process.Refresh()
             if ($null -ne $Process.ExitCode) {
                 return [int]$Process.ExitCode
             }
         } catch { }
     }
-
-    $fromLog = Get-OfficeSetupExitCodeFromLog -LogPath $LogPath
-    if ($null -ne $fromLog) { return [int]$fromLog }
 
     return 1
 }
@@ -2047,7 +2281,9 @@ function Wait-OfficeSetupWithProgress {
         [string]$LogDirectory,
         [DateTime]$StartedAt,
         [int]$StallWarningSeconds = 180,
-        [switch]$ShowProgress
+        [switch]$ShowProgress,
+        [ValidateSet('Install', 'Uninstall', 'RemoveApps', 'Unknown')]
+        [string]$SetupOperation = 'Unknown'
     )
 
     if (-not $Process) { return -1 }
@@ -2057,15 +2293,19 @@ function Wait-OfficeSetupWithProgress {
     }
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $lastStatus = 'Запуск setup.exe...'
+    $lastStatus = if ($SetupOperation -eq 'Uninstall') { 'Запуск видалення...' } else { 'Запуск setup.exe...' }
     $lastPercent = -1
     $seenPos = 0
     $activeLog = $null
     $lastActivity = [DateTime]::UtcNow
     $warnedStall = $false
     $lastSync = [DateTime]::MinValue
-    $tempSearchPaths = Get-OfficeSetupTempSearchPaths -ExtraPaths @($LogDirectory)
-    $searchPaths = if ($LogDirectory) { @($LogDirectory) + $tempSearchPaths } else { $tempSearchPaths }
+    $workDir = if ($LogDirectory) { Get-OfficeSetupWorkDirectory -LogDirectory $LogDirectory } else { $null }
+    $tempSearchPaths = Get-OfficeSetupTempSearchPaths -ExtraPaths @($LogDirectory, $workDir)
+    $searchPaths = @()
+    if ($LogDirectory) { $searchPaths += $LogDirectory }
+    if ($workDir) { $searchPaths += $workDir }
+    $searchPaths += $tempSearchPaths
 
     if ($ShowProgress) {
         Show-OfficeSetupProgressLine -Status $lastStatus -Percent $lastPercent -Elapsed $sw.Elapsed
@@ -2098,7 +2338,7 @@ function Wait-OfficeSetupWithProgress {
                         $reader = New-Object System.IO.StreamReader($stream)
                         while (-not $reader.EndOfStream) {
                             $line = $reader.ReadLine()
-                            $parsed = Convert-OfficeSetupLogLine -Line $line
+                            $parsed = Convert-OfficeSetupLogLine -Line $line -SetupOperation $SetupOperation
                             if (-not $parsed) { continue }
 
                             $lastActivity = [DateTime]::UtcNow
@@ -2141,6 +2381,30 @@ function Wait-OfficeSetupWithProgress {
         }
     }
 
+    $postExitDeadline = [DateTime]::UtcNow.AddSeconds(120)
+    while ([DateTime]::UtcNow -lt $postExitDeadline) {
+        if ($LogDirectory -and ((Get-Date) - $lastSync).TotalSeconds -ge 2) {
+            Sync-OfficeSetupLogsToDirectory -LogDirectory $LogDirectory -NotBefore $StartedAt | Out-Null
+            $lastSync = Get-Date
+        }
+
+        $exitFromLog = Get-OfficeSetupExitCodeFromLogs -SearchPaths $searchPaths -NotBefore $StartedAt
+        if ($null -ne $exitFromLog) { break }
+
+        $stillRunning = @(Get-OfficeInstallRelatedProcesses | Where-Object { $_.ProcessName -ne 'setup' })
+        if ($stillRunning.Count -eq 0) {
+            Start-Sleep -Seconds 2
+            break
+        }
+
+        if ($ShowProgress) {
+            $lastStatus = 'Завершення Office Click-to-Run...'
+            Show-OfficeSetupProgressLine -Status $lastStatus -Percent $lastPercent -Elapsed $sw.Elapsed
+        }
+
+        Start-Sleep -Milliseconds 500
+    }
+
     if ($LogDirectory) {
         Sync-OfficeSetupLogsToDirectory -LogDirectory $LogDirectory -NotBefore $StartedAt | Out-Null
     }
@@ -2155,7 +2419,8 @@ function Wait-OfficeSetupWithProgress {
         @()
     }
 
-    $logForExit = if ($syncedLogs.Count -gt 0) { $syncedLogs[0] } else { $null }
+    $primaryLog = Get-ActiveOfficeSetupLogFile -SearchPaths $searchPaths -NotBefore $StartedAt
+    $logForExit = if ($primaryLog) { $primaryLog.FullName } elseif ($syncedLogs.Count -gt 0) { $syncedLogs[0] } else { $null }
 
     if (-not $logForExit -and $activeLog -and $LogDirectory) {
         $logForExit = Save-OfficeSetupLogCopy -SourceLog $activeLog -LogDirectory $LogDirectory
@@ -2167,7 +2432,7 @@ function Wait-OfficeSetupWithProgress {
         try {
             $tail = Get-Content -LiteralPath $logForExit -Tail 30 -ErrorAction Stop
             foreach ($line in $tail) {
-                $parsed = Convert-OfficeSetupLogLine -Line $line
+                $parsed = Convert-OfficeSetupLogLine -Line $line -SetupOperation $SetupOperation
                 if ($parsed -and $parsed.Kind -eq 'Error') {
                     Write-Host "  [!] $($parsed.Text)" -ForegroundColor Red
                 }
@@ -2183,7 +2448,7 @@ function Wait-OfficeSetupWithProgress {
         Write-Host ""
     }
 
-    return (Resolve-ProcessExitCode -Process $Process -LogPath $logForExit)
+    return (Resolve-ProcessExitCode -Process $Process -LogPath $logForExit -SearchPaths $searchPaths -NotBefore $StartedAt)
 }
 
 function Wait-ProcessWithProgress {
@@ -2215,7 +2480,9 @@ function Invoke-SetupConfigureWithProgress {
         [string]$ConfigPath,
         [string]$Description,
         [string]$InstallDir,
-        [switch]$ShowTerminalProgress
+        [switch]$ShowTerminalProgress,
+        [ValidateSet('Install', 'Uninstall', 'RemoveApps', 'Unknown')]
+        [string]$SetupOperation = 'Install'
     )
 
     Write-Host "  [i] $Description" -ForegroundColor Cyan
@@ -2241,7 +2508,8 @@ function Invoke-SetupConfigureWithProgress {
             -Process $proc `
             -LogDirectory $logDir `
             -StartedAt $startedAt `
-            -ShowProgress:$ShowTerminalProgress
+            -ShowProgress:$ShowTerminalProgress `
+            -SetupOperation $SetupOperation
     } finally {
         Restore-OfficeSetupEnvironment -State $envState
         if ($logDir) {
@@ -2437,6 +2705,7 @@ function Invoke-RemoveTeamsSkype {
         Set-Location $InstallDir
         $null = Invoke-SetupConfigureWithProgress -SetupPath (Join-Path $InstallDir 'setup.exe') `
             -ConfigPath $config -InstallDir $InstallDir -ShowTerminalProgress `
+            -SetupOperation RemoveApps `
             -Description 'Видалення Skype for Business з пакету Office'
         Write-Host ""
     } elseif ($needsOfficeConfigure) {
@@ -2488,6 +2757,9 @@ switch ($Command) {
     }
     'Install' {
         Invoke-InstallOffice2021
+    }
+    'Uninstall' {
+        Invoke-UninstallOffice
     }
     'VerifyInstall' {
         Invoke-VerifyOfficeInstall -SetupExitCode $SetupExitCode -AlreadyInstalled:$AlreadyInstalled
