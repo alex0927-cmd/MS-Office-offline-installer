@@ -313,6 +313,142 @@ function Invoke-PrepareInstallConfig {
     Write-Output $outPath
 }
 
+# --- Download helpers
+
+function Enable-ModernTls {
+    try {
+        $protocols = [Net.ServicePointManager]::SecurityProtocol
+        $protocols = $protocols -bor [Net.SecurityProtocolType]::Tls12
+        if ([Enum]::IsDefined([Net.SecurityProtocolType], 'Tls13')) {
+            $protocols = $protocols -bor [Net.SecurityProtocolType]::Tls13
+        }
+        [Net.ServicePointManager]::SecurityProtocol = $protocols
+    } catch { }
+}
+
+function Test-MicrosoftDownloadAccess {
+    param(
+        [string]$Url = 'https://download.microsoft.com'
+    )
+
+    Enable-ModernTls
+
+    $hostName = 'download.microsoft.com'
+    try {
+        $hostName = ([Uri]$Url).Host
+    } catch { }
+
+    try {
+        $tcp = Test-NetConnection -ComputerName $hostName -Port 443 `
+            -WarningAction SilentlyContinue -ErrorAction Stop
+        if ($tcp.TcpTestSucceeded) { return $true }
+    } catch { }
+
+    try {
+        return Test-Connection -ComputerName $hostName -Count 1 -Quiet -ErrorAction Stop
+    } catch {
+        return $false
+    }
+}
+
+function Save-RemoteFile {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][string]$Destination,
+        [int]$TimeoutSec = 300,
+        [long]$MinBytes = 100KB
+    )
+
+    Enable-ModernTls
+    $errors = New-Object System.Collections.Generic.List[string]
+
+    if (Test-Path -LiteralPath $Destination) {
+        Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+    }
+
+    try {
+        $iwrParams = @{
+            Uri             = $Uri
+            OutFile         = $Destination
+            UseBasicParsing = $true
+            TimeoutSec      = $TimeoutSec
+        }
+        if ($PSVersionTable.PSVersion.Major -lt 6) {
+            $iwrParams['Headers'] = @{ 'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+        }
+        Invoke-WebRequest @iwrParams -ErrorAction Stop
+        if ((Test-Path -LiteralPath $Destination) -and (Get-Item -LiteralPath $Destination).Length -ge $MinBytes) {
+            return
+        }
+        Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        throw 'Завантажений файл занадто малий або порожній'
+    } catch {
+        $errors.Add("Invoke-WebRequest: $($_.Exception.Message)")
+    }
+
+    try {
+        if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {
+            Start-BitsTransfer -Source $Uri -Destination $Destination -TransferType Download -ErrorAction Stop
+            if ((Test-Path -LiteralPath $Destination) -and (Get-Item -LiteralPath $Destination).Length -ge $MinBytes) {
+                return
+            }
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+            throw 'Завантажений файл занадто малий або порожній'
+        }
+    } catch {
+        $errors.Add("BITS: $($_.Exception.Message)")
+    }
+
+    try {
+        if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
+            & curl.exe -fL --retry 3 --connect-timeout 30 --max-time $TimeoutSec `
+                -o $Destination $Uri 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $Destination) `
+                -and (Get-Item -LiteralPath $Destination).Length -ge $MinBytes) {
+                return
+            }
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+            throw "curl завершився з кодом $LASTEXITCODE"
+        }
+    } catch {
+        $errors.Add("curl: $($_.Exception.Message)")
+    }
+
+    $details = ($errors | ForEach-Object { "      - $_" }) -join [Environment]::NewLine
+    throw "Не вдалося завантажити файл з Microsoft.`n$details"
+}
+
+function Invoke-OdtExtract {
+    param(
+        [Parameter(Mandatory)][string]$InstallerPath,
+        [Parameter(Mandatory)][string]$TargetDir
+    )
+
+    $extractArgList = @("/extract:`"$TargetDir`"", '/quiet')
+    $cmdLine = "`"$InstallerPath`" /extract:`"$TargetDir`" /quiet"
+
+    cmd /c $cmdLine 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { return 0 }
+
+    try {
+        $proc = Start-Process -FilePath $InstallerPath -ArgumentList $extractArgList `
+            -Wait -PassThru -NoNewWindow -ErrorAction Stop
+        return $proc.ExitCode
+    } catch {
+        if ($_.Exception.Message -notmatch 'elevation|administrator|адміністратор') {
+            return 1
+        }
+
+        try {
+            $proc = Start-Process -FilePath $InstallerPath -ArgumentList $extractArgList `
+                -Wait -PassThru -Verb RunAs -ErrorAction Stop
+            return $proc.ExitCode
+        } catch {
+            return 1
+        }
+    }
+}
+
 # --- Download-Odt (setup.exe) 
 
 function Invoke-DownloadOdt {
@@ -329,60 +465,64 @@ function Invoke-DownloadOdt {
     }
 
     $setupPath = Join-Path $TargetDir 'setup.exe'
+    $url = Get-OdtDownloadUrl -Dir $TargetDir
 
     Write-Host ""
-    Write-Host "  [i] Перевірка інтернет-з'єднання з сервером Microsoft..." -ForegroundColor Cyan
+    Write-Host "  [i] Перевірка доступу до download.microsoft.com (HTTPS)..." -ForegroundColor Cyan
 
-    $online = $false
-    try {
-        $online = Test-Connection -ComputerName 'www.microsoft.com' -Count 1 -Quiet -ErrorAction Stop
-    } catch {
-        $online = $false
-    }
-
-    if (-not $online) {
-        Write-Host "  [X] Інтернет недоступний. Завантаження неможливе." -ForegroundColor Red
+    if (-not (Test-MicrosoftDownloadAccess -Url $url)) {
+        Write-Host "  [X] Немає доступу до серверів Microsoft (порт 443)." -ForegroundColor Red
+        Write-Host "      Перевірте інтернет, проксі, VPN або брандмауер." -ForegroundColor Yellow
         exit 1
     }
-    Write-Host "  [OK] Інтернет доступний" -ForegroundColor Green
+    Write-Host "  [OK] Сервер Microsoft доступний" -ForegroundColor Green
 
     if (Test-Path -LiteralPath $setupPath) {
         Write-Host ""
         Write-Host "  [i] setup.exe уже існує у $TargetDir" -ForegroundColor Yellow
     }
 
-    $url = Get-OdtDownloadUrl -Dir $TargetDir
     $tempExe = Join-Path $env:TEMP ("odt_{0}.exe" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
 
     Write-Host ""
     Write-Host "  Завантаження Office Deployment Tool..." -ForegroundColor Cyan
     Write-Host "  Джерело: Microsoft" -ForegroundColor Gray
+    Write-Host "  URL:     $url" -ForegroundColor Gray
     Write-Host "  Куди:    $TargetDir" -ForegroundColor Gray
     Write-Host ""
 
     try {
-        Invoke-WebRequest -Uri $url -OutFile $tempExe -UseBasicParsing
+        Save-RemoteFile -Uri $url -Destination $tempExe -MinBytes 1MB
     } catch {
-        Write-Host "  [X] Не вдалося завантажити ODT: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "  [X] Не вдалося завантажити ODT:" -ForegroundColor Red
+        Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "  Поради:" -ForegroundColor Yellow
+        Write-Host "    - завантажте ODT вручну з https://www.microsoft.com/download/details.aspx?id=49117" -ForegroundColor Yellow
+        Write-Host "    - запустіть officedeploymenttool_*.exe і вкажіть папку: $TargetDir" -ForegroundColor Yellow
         exit 1
     }
 
+    Write-Host "  [OK] ODT завантажено ($(Format-Size (Get-Item -LiteralPath $tempExe).Length))" -ForegroundColor Green
     Write-Host "  Розпакування setup.exe..." -ForegroundColor Cyan
 
-    $extractArgs = "/extract:`"$TargetDir`"", '/quiet'
-    $proc = Start-Process -FilePath $tempExe -ArgumentList $extractArgs -Wait -PassThru -NoNewWindow
+    $extractCode = Invoke-OdtExtract -InstallerPath $tempExe -TargetDir $TargetDir
 
     Remove-Item -LiteralPath $tempExe -Force -ErrorAction SilentlyContinue
 
     Write-Host ""
 
-    if ((Test-Path -LiteralPath $setupPath) -and $proc.ExitCode -eq 0) {
+    if (Test-Path -LiteralPath $setupPath) {
+        if ($extractCode -and $extractCode -ne 0) {
+            Write-Host "  [i] setup.exe створено (код розпакування: $extractCode)" -ForegroundColor Yellow
+        }
         Write-Host "  [OK] setup.exe готовий до роботи" -ForegroundColor Green
         Write-Host "       $setupPath" -ForegroundColor Green
         exit 0
     }
 
-    Write-Host "  [X] setup.exe не з'явився (код розпакування: $($proc.ExitCode))" -ForegroundColor Red
+    Write-Host "  [X] setup.exe не з'явився (код розпакування: $extractCode)" -ForegroundColor Red
+    Write-Host "      Спробуйте запустити інсталятор ODT вручну і вказати папку $TargetDir" -ForegroundColor Yellow
     exit 1
 }
 
@@ -484,20 +624,14 @@ function Invoke-DownloadOfficePackage {
     }
 
     Write-Host ""
-    Write-Host "  [i] Перевірка інтернет-з'єднання..." -ForegroundColor Cyan
+    Write-Host "  [i] Перевірка доступу до серверів Microsoft (HTTPS)..." -ForegroundColor Cyan
 
-    $online = $false
-    try {
-        $online = Test-Connection -ComputerName 'www.microsoft.com' -Count 1 -Quiet -ErrorAction Stop
-    } catch {
-        $online = $false
-    }
-
-    if (-not $online) {
-        Write-Host "  [X] Інтернет недоступний. Завантаження неможливе." -ForegroundColor Red
+    if (-not (Test-MicrosoftDownloadAccess)) {
+        Write-Host "  [X] Немає доступу до серверів Microsoft (порт 443)." -ForegroundColor Red
+        Write-Host "      Перевірте інтернет, проксі, VPN або брандмауер." -ForegroundColor Yellow
         exit 1
     }
-    Write-Host "  [OK] Інтернет доступний" -ForegroundColor Green
+    Write-Host "  [OK] Сервер Microsoft доступний" -ForegroundColor Green
 
     $setup = Join-Path $InstallDir 'setup.exe'
     $config = Join-Path $InstallDir 'configuration-download.xml'

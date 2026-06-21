@@ -1,0 +1,14 @@
+# ODT (завантажується пунктом [1])
+setup.exe
+
+# Офлайн-пакет Office (завантажується пунктом [2])
+Office/
+
+# Автогенеровані XML (з configurations.xml або ODT)
+configuration*.xml
+!configurations.xml
+
+# Windows
+Thumbs.db
+Desktop.ini
+*.tmp
