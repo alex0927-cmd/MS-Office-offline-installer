@@ -2,6 +2,8 @@
 
 <img width="544" height="558" alt="image" src="https://github.com/user-attachments/assets/669ff73d-b16b-4279-8d49-bf6ebbcff65f" />
 
+<img width="562" height="671" alt="image" src="https://github.com/user-attachments/assets/86437ee7-0233-47e6-8cb8-8139064cd8de" />
+
 
 Офлайн-інсталятор Microsoft Office на базі **Office Deployment Tool (ODT)**. Скрипт дозволяє:
 
