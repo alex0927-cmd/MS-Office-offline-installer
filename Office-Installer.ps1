@@ -4,7 +4,7 @@
 #         Verify-OfficeInstall, Verify-OfficeRemoved
 
 param(
-    [ValidateSet('PrepareConfig', 'PrepareInstallConfig', 'Download', 'DownloadOdt', 'Install', 'Uninstall', 'VerifyInstall', 'VerifyRemoved', 'ResolvePaths', 'GetInstalledOffice', 'CheckTeamsSkype', 'RemoveTeamsSkype')]
+    [ValidateSet('PrepareConfig', 'PrepareInstallConfig', 'Download', 'DownloadOdt', 'Install', 'Uninstall', 'VerifyInstall', 'VerifyRemoved', 'ResolvePaths', 'GetInstalledOffice', 'CheckTeamsSkype', 'RemoveTeamsSkype', 'Activate')]
     [string]$Command = 'Install',
 
     [string]$InstallDir,
@@ -20,7 +20,12 @@ param(
     [switch]$Reinstall,
 
     [int]$SetupExitCode = 0,
-    [switch]$AlreadyInstalled
+    [switch]$AlreadyInstalled,
+
+    [string]$ProductKey,
+    [string]$KmsHost,
+    [int]$KmsPort = 0,
+    [switch]$ActivateOnly
 )
 
 # --- Init-ConsoleEncoding 
@@ -1286,6 +1291,490 @@ function Write-StatusLine {
     Write-Host $Text
 }
 
+function Get-OsppScriptPath {
+    $candidates = @(
+        'C:\Program Files\Microsoft Office\Office16\OSPP.VBS',
+        'C:\Program Files (x86)\Microsoft Office\Office16\OSPP.VBS',
+        'C:\Program Files\Microsoft Office\root\Office16\OSPP.VBS'
+    )
+    foreach ($root in @(
+        'C:\Program Files\Microsoft Office\root\Office16',
+        'C:\Program Files\Microsoft Office\Office16'
+    )) {
+        $candidates += Join-Path $root 'OSPP.VBS'
+    }
+    foreach ($path in ($candidates | Select-Object -Unique)) {
+        if (Test-Path -LiteralPath $path) { return (Resolve-Path -LiteralPath $path).Path }
+    }
+    return $null
+}
+
+function Test-WindowsScriptHostEnabled {
+    foreach ($regPath in @(
+        'HKLM:\Software\Microsoft\Windows Script Host\Settings',
+        'HKCU:\Software\Microsoft\Windows Script Host\Settings'
+    )) {
+        if (-not (Test-Path -LiteralPath $regPath)) { continue }
+        $enabled = (Get-ItemProperty -LiteralPath $regPath -Name Enabled -ErrorAction SilentlyContinue).Enabled
+        if ($null -ne $enabled -and [int]$enabled -eq 0) { return $false }
+    }
+    return $true
+}
+
+function Test-OsppVbsBlockedOutput {
+    param([string]$Text)
+    return ($Text -match '(?i)(Script Host access is disabled|execution of scripts is disabled|ActiveX component can''t create object)')
+}
+
+function Test-OfficeLicenseUsesWmi {
+    return -not (Test-WindowsScriptHostEnabled)
+}
+
+function Get-OfficeSoftwareLicensingProducts {
+    $appId = '59A52893-A989-479D-AF46-F275C0160663'
+    return @(Get-CimInstance -ClassName SoftwareLicensingProduct -ErrorAction SilentlyContinue |
+        Where-Object { $_.ApplicationId -eq $appId -and $_.PartialProductKey })
+}
+
+function Convert-OfficeLicenseStatusCode {
+    param([int]$Code)
+    switch ($Code) {
+        0 { return '---UNLICENSED---' }
+        1 { return '---LICENSED---' }
+        5 { return '---NOTIFICATIONS---' }
+        2 { return '---OOB_GRACE---' }
+        3 { return '---OOT_GRACE---' }
+        default { return "---STATUS_${Code}---" }
+    }
+}
+
+function Get-OfficeLicenseInfoFromWmi {
+    $products = @(Get-OfficeSoftwareLicensingProducts)
+    if ($products.Count -eq 0) {
+        return [PSCustomObject]@{
+            Available = $true; TimedOut = $false; Licensed = $false
+            LicenseStatus = $null; LicenseDescription = $null; LicenseName = $null
+            ProductKeyLast5 = $null; KmsHost = $null
+            Error = 'Ключ продукту не встановлено'
+            Raw = $null; Backend = 'Wmi'
+        }
+    }
+
+    $product = $products | Select-Object -First 1
+    $status = Convert-OfficeLicenseStatusCode -Code [int]$product.LicenseStatus
+    $kmsHost = $null
+    if ($product.KeyManagementServiceMachine) { $kmsHost = [string]$product.KeyManagementServiceMachine }
+
+    return [PSCustomObject]@{
+        Available = $true; TimedOut = $false; Licensed = ($product.LicenseStatus -eq 1)
+        LicenseStatus = $status
+        LicenseDescription = [string]$product.Description
+        LicenseName = [string]$product.Name
+        ProductKeyLast5 = [string]$product.PartialProductKey
+        KmsHost = $kmsHost
+        Error = $null; Raw = $null; Backend = 'Wmi'
+    }
+}
+
+function Invoke-OfficeOnlineActivationWmi {
+    Write-Host ""
+    Write-StatusLine 'i' 'Активація Office (PowerShell / WMI)...' 'Cyan'
+    Write-Host "      Потрібен доступ до серверів Microsoft або KMS." -ForegroundColor Gray
+
+    $products = @(Get-OfficeSoftwareLicensingProducts)
+    if ($products.Count -eq 0) {
+        Write-StatusLine 'X' 'Ключ продукту не встановлено — спочатку введіть ключ' 'Red'
+        return 1
+    }
+
+    foreach ($product in $products) {
+        try {
+            $null = Invoke-CimMethod -InputObject $product -MethodName Activate -ErrorAction Stop
+        } catch {
+            Write-StatusLine '!' "Activate: $($_.Exception.Message)" 'Yellow'
+        }
+    }
+
+    Start-Sleep -Seconds 2
+    $info = Get-OfficeLicenseInfoFromWmi
+    if ($info.Licensed) {
+        Write-StatusLine 'OK' 'Office активовано успішно' 'Green'
+        return 0
+    }
+    Write-StatusLine '!' 'Office ще не активовано' 'Yellow'
+    return 1
+}
+
+function Invoke-OfficeProductKeyActivationWmi {
+    param([Parameter(Mandatory)][string]$ProductKey)
+
+    $key = Normalize-ProductKey -Key $ProductKey
+    if (-not (Test-ProductKeyFormat -Key $key)) {
+        Write-StatusLine 'X' 'Невірний формат ключа' 'Red'
+        return 2
+    }
+
+    Write-Host ""
+    Write-StatusLine 'i' 'Встановлення ключа продукту (PowerShell / WMI)...' 'Cyan'
+    try {
+        $svc = Get-CimInstance -ClassName SoftwareLicensingService -ErrorAction Stop
+        $result = Invoke-CimMethod -InputObject $svc -MethodName InstallProductKey -Arguments @{ ProductKey = $key } -ErrorAction Stop
+        if ($result.ReturnValue -and [int]$result.ReturnValue -ne 0) {
+            Write-StatusLine 'X' "InstallProductKey: код $($result.ReturnValue)" 'Red'
+            return 1
+        }
+        $null = Invoke-CimMethod -InputObject $svc -MethodName RefreshLicenseStatus -ErrorAction SilentlyContinue
+    } catch {
+        Write-StatusLine 'X' $_.Exception.Message 'Red'
+        return 1
+    }
+
+    Write-StatusLine 'OK' 'Ключ встановлено' 'Green'
+    return (Invoke-OfficeOnlineActivationWmi)
+}
+
+function Invoke-OfficeKmsActivationWmi {
+    param(
+        [Parameter(Mandatory)][string]$KmsHost,
+        [int]$KmsPort = 1688
+    )
+
+    $hostName = $KmsHost.Trim()
+    if ([string]::IsNullOrWhiteSpace($hostName)) {
+        Write-StatusLine 'X' 'KMS-сервер не вказано' 'Red'
+        return 2
+    }
+    if ($KmsPort -le 0) { $KmsPort = 1688 }
+
+    Write-Host ""
+    Write-StatusLine 'i' "Налаштування KMS: ${hostName}:${KmsPort} (PowerShell / WMI)" 'Cyan'
+    try {
+        $svc = Get-CimInstance -ClassName SoftwareLicensingService -ErrorAction Stop
+        $null = Invoke-CimMethod -InputObject $svc -MethodName SetKeyManagementServiceMachine -Arguments @{
+            KeyManagementServiceMachine = $hostName
+        } -ErrorAction Stop
+        if ($KmsPort -ne 1688) {
+            $null = Invoke-CimMethod -InputObject $svc -MethodName SetKeyManagementServicePort -Arguments @{
+                KeyManagementServicePort = $KmsPort
+            } -ErrorAction Stop
+        }
+        $null = Invoke-CimMethod -InputObject $svc -MethodName RefreshLicenseStatus -ErrorAction SilentlyContinue
+    } catch {
+        Write-StatusLine 'X' $_.Exception.Message 'Red'
+        return 1
+    }
+
+    return (Invoke-OfficeOnlineActivationWmi)
+}
+
+function Invoke-OsppScript {
+    param(
+        [Parameter(Mandatory)][string]$OsppPath,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [int]$TimeoutSeconds = 90
+    )
+
+    if (-not (Test-Path -LiteralPath $OsppPath)) {
+        return [PSCustomObject]@{ Success = $false; Output = ''; TimedOut = $false; VbsBlocked = $false }
+    }
+
+    try {
+        $output = & cscript.exe //nologo $OsppPath @Arguments 2>&1 | Out-String
+    } catch {
+        return [PSCustomObject]@{
+            Success = $false; Output = [string]$_.Exception.Message; TimedOut = $false; VbsBlocked = $false
+        }
+    }
+
+    $output = $output.Trim()
+    if (Test-OsppVbsBlockedOutput -Text $output) {
+        return [PSCustomObject]@{ Success = $false; Output = $output; TimedOut = $false; VbsBlocked = $true }
+    }
+    if ($output -match 'Office \d+ Client Software License Management Tool') {
+        return [PSCustomObject]@{ Success = $false; Output = ''; TimedOut = $false; VbsBlocked = $false }
+    }
+
+    return [PSCustomObject]@{ Success = $true; Output = $output; TimedOut = $false; VbsBlocked = $false }
+}
+
+function Normalize-ProductKey {
+    param([string]$Key)
+    return (($Key -replace '\s', '').ToUpper())
+}
+
+function Test-ProductKeyFormat {
+    param([string]$Key)
+    return (Normalize-ProductKey -Key $Key) -match '^[A-Z0-9]{5}(?:-[A-Z0-9]{5}){4}$'
+}
+
+function Get-OfficeLicenseInfo {
+    param([Parameter(Mandatory)][string]$OsppPath)
+
+    if (Test-OfficeLicenseUsesWmi) {
+        return Get-OfficeLicenseInfoFromWmi
+    }
+
+    $result = Invoke-OsppScript -OsppPath $OsppPath -Arguments @('/dstatus')
+    if ($result.VbsBlocked -or (Test-OsppVbsBlockedOutput -Text $result.Output)) {
+        return Get-OfficeLicenseInfoFromWmi
+    }
+    if ($result.TimedOut) {
+        return [PSCustomObject]@{
+            Available = $false; TimedOut = $true; Licensed = $false
+            LicenseStatus = $null; ProductKeyLast5 = $null; KmsHost = $null; Error = $null
+        }
+    }
+    if (-not $result.Success -or [string]::IsNullOrWhiteSpace($result.Output)) {
+        $wmiInfo = Get-OfficeLicenseInfoFromWmi
+        if ($wmiInfo.ProductKeyLast5 -or $wmiInfo.LicenseStatus) { return $wmiInfo }
+        return [PSCustomObject]@{
+            Available = $false; TimedOut = $false; Licensed = $false
+            LicenseStatus = $null; ProductKeyLast5 = $null; KmsHost = $null
+            Error = 'Не вдалося отримати статус ліцензії (ospp.vbs)'
+        }
+    }
+
+    $raw = $result.Output
+    $info = [ordered]@{
+        Available = $true; TimedOut = $false; Licensed = $false
+        LicenseStatus = $null; LicenseDescription = $null; LicenseName = $null
+        ProductKeyLast5 = $null; KmsHost = $null; Error = $null; Raw = $raw
+    }
+
+    if ($raw -match 'LICENSE STATUS:\s+([^\r\n]+)') {
+        $info.LicenseStatus = $Matches[1].Trim()
+        $info.Licensed = ($info.LicenseStatus -eq '---LICENSED---')
+    }
+    if ($raw -match 'LICENSE DESCRIPTION:\s+([^\r\n]+)') { $info.LicenseDescription = $Matches[1].Trim() }
+    if ($raw -match 'Last 5 characters of installed product key:\s+(\S+)') { $info.ProductKeyLast5 = $Matches[1].Trim() }
+    if ($raw -match 'KMS machine name:\s+([^\r\n]+)') { $info.KmsHost = $Matches[1].Trim() }
+    if ($raw -match 'ERROR DESCRIPTION:\s+([^\r\n]+)') { $info.Error = $Matches[1].Trim() }
+    $info.Backend = 'Ospp'
+
+    return [PSCustomObject]$info
+}
+
+function Show-OfficeLicenseStatus {
+    param([string]$OsppPath, [switch]$Detailed)
+
+    if (-not $OsppPath) { $OsppPath = Get-OsppScriptPath }
+    if (-not $OsppPath -and -not (Test-OfficeLicenseUsesWmi)) {
+        Write-StatusLine '?' 'OSPP.VBS не знайдено' 'Yellow'
+        return $null
+    }
+    if (-not $OsppPath) { $OsppPath = 'N/A' }
+
+    $info = Get-OfficeLicenseInfo -OsppPath $OsppPath
+    if ($info.TimedOut) {
+        Write-StatusLine '?' 'Перевірка активації занадто довга' 'Yellow'
+        return $info
+    }
+    if ($info.Error) { Write-StatusLine 'X' $info.Error 'Red' }
+    elseif (-not $info.Available) {
+        Write-StatusLine '?' 'Не вдалося визначити статус ліцензії' 'Yellow'
+    } elseif ($info.Licensed) {
+        Write-StatusLine 'OK' 'Office активовано' 'Green'
+    } elseif ($info.LicenseStatus -eq '---UNLICENSED---') {
+        Write-StatusLine '!' 'Office НЕ активовано' 'Yellow'
+    } elseif ($info.LicenseStatus -eq '---NOTIFICATIONS---') {
+        Write-StatusLine '!' 'Office потребує активації' 'Yellow'
+    } elseif ($info.LicenseStatus) {
+        Write-StatusLine '?' "Статус: $($info.LicenseStatus)" 'Yellow'
+    } else {
+        Write-StatusLine '?' 'Не вдалося визначити статус ліцензії' 'Yellow'
+    }
+
+    if ($Detailed) {
+        if ($info.LicenseDescription) { Write-Host "    Опис:   $($info.LicenseDescription)" }
+        if ($info.ProductKeyLast5) { Write-Host "    Ключ:   ...$($info.ProductKeyLast5)" }
+        if ($info.KmsHost) { Write-Host "    KMS:    $($info.KmsHost)" }
+        if ($info.Error) { Write-Host "    Помилка: $($info.Error)" -ForegroundColor Red }
+    }
+    return $info
+}
+
+function Invoke-OfficeOnlineActivation {
+    param([Parameter(Mandatory)][string]$OsppPath)
+
+    if (Test-OfficeLicenseUsesWmi) {
+        return (Invoke-OfficeOnlineActivationWmi)
+    }
+
+    Write-Host ""
+    Write-StatusLine 'i' 'Активація Office (ospp.vbs /act)...' 'Cyan'
+    Write-Host "      Потрібен доступ до серверів Microsoft або KMS." -ForegroundColor Gray
+
+    $act = Invoke-OsppScript -OsppPath $OsppPath -Arguments @('/act') -TimeoutSeconds 120
+    if ($act.TimedOut) {
+        Write-StatusLine '!' 'Активація занадто довга' 'Yellow'
+        return 1
+    }
+    if (-not $act.Success) {
+        if ($act.VbsBlocked -or (Test-OsppVbsBlockedOutput -Text $act.Output)) {
+            return (Invoke-OfficeOnlineActivationWmi)
+        }
+        Write-StatusLine 'X' 'Не вдалося запустити ospp.vbs /act' 'Red'
+        return 1
+    }
+
+    $info = Get-OfficeLicenseInfo -OsppPath $OsppPath
+    if ($info.Licensed) {
+        Write-StatusLine 'OK' 'Office активовано успішно' 'Green'
+        return 0
+    }
+    if ($info.Error) { Write-StatusLine 'X' $info.Error 'Red' }
+    else { Write-StatusLine '!' 'Office ще не активовано' 'Yellow' }
+    return 1
+}
+
+function Invoke-OfficeProductKeyActivation {
+    param(
+        [Parameter(Mandatory)][string]$OsppPath,
+        [Parameter(Mandatory)][string]$ProductKey
+    )
+
+    if (Test-OfficeLicenseUsesWmi) {
+        return (Invoke-OfficeProductKeyActivationWmi -ProductKey $ProductKey)
+    }
+
+    $key = Normalize-ProductKey -Key $ProductKey
+    if (-not (Test-ProductKeyFormat -Key $key)) {
+        Write-StatusLine 'X' 'Невірний формат ключа' 'Red'
+        return 2
+    }
+
+    Write-Host ""
+    Write-StatusLine 'i' 'Встановлення ключа продукту...' 'Cyan'
+    $install = Invoke-OsppScript -OsppPath $OsppPath -Arguments @("/inpkey:$key")
+    if ($install.VbsBlocked -or (Test-OsppVbsBlockedOutput -Text $install.Output)) {
+        return (Invoke-OfficeProductKeyActivationWmi -ProductKey $key)
+    }
+    Write-StatusLine 'OK' 'Ключ встановлено' 'Green'
+    return (Invoke-OfficeOnlineActivation -OsppPath $OsppPath)
+}
+
+function Invoke-OfficeKmsActivation {
+    param(
+        [Parameter(Mandatory)][string]$OsppPath,
+        [Parameter(Mandatory)][string]$KmsHost,
+        [int]$KmsPort = 1688
+    )
+
+    if (Test-OfficeLicenseUsesWmi) {
+        return (Invoke-OfficeKmsActivationWmi -KmsHost $KmsHost -KmsPort $KmsPort)
+    }
+
+    $hostName = $KmsHost.Trim()
+    if ([string]::IsNullOrWhiteSpace($hostName)) {
+        Write-StatusLine 'X' 'KMS-сервер не вказано' 'Red'
+        return 2
+    }
+    if ($KmsPort -le 0) { $KmsPort = 1688 }
+
+    Write-Host ""
+    Write-StatusLine 'i' "Налаштування KMS: ${hostName}:${KmsPort}" 'Cyan'
+    $setHost = Invoke-OsppScript -OsppPath $OsppPath -Arguments @("/sethst:$hostName")
+    if ($setHost.VbsBlocked -or (Test-OsppVbsBlockedOutput -Text $setHost.Output)) {
+        return (Invoke-OfficeKmsActivationWmi -KmsHost $hostName -KmsPort $KmsPort)
+    }
+    if ($KmsPort -ne 1688) {
+        $null = Invoke-OsppScript -OsppPath $OsppPath -Arguments @("/setprt:$KmsPort")
+    }
+
+    $info = Get-OfficeLicenseInfo -OsppPath $OsppPath
+    if (-not $info.ProductKeyLast5) {
+        Write-Host "  [i] Спочатку введіть ключ Volume/MAK (пункт [1] у меню активації)." -ForegroundColor Yellow
+        return 2
+    }
+    return (Invoke-OfficeOnlineActivation -OsppPath $OsppPath)
+}
+
+function Invoke-ActivateOffice {
+    Initialize-UkrainianConsole
+    $ErrorActionPreference = 'Continue'
+
+    Write-Host ""
+    Write-StatusLine 'i' 'Активація Microsoft Office' 'Cyan'
+    Write-Host ""
+
+    if (@(Get-InstalledOfficeInfo).Count -eq 0) {
+        Write-StatusLine 'X' 'Office не встановлено — спочатку пункт [3]' 'Red'
+        exit 1
+    }
+
+    $ospp = Get-OsppScriptPath
+    $useWmi = Test-OfficeLicenseUsesWmi
+    if (-not $useWmi -and -not $ospp) {
+        Write-StatusLine 'X' 'OSPP.VBS не знайдено' 'Red'
+        exit 1
+    }
+    if ($useWmi) {
+        Write-Host "  [i] Виконання .vbs заблоковано — активація через PowerShell (WMI/CIM)" -ForegroundColor Yellow
+        Write-Host ""
+    }
+    if (-not $ospp) { $ospp = 'N/A' }
+
+    Write-Host "  Поточний статус:" -ForegroundColor Yellow
+    $info = Show-OfficeLicenseStatus -OsppPath $ospp -Detailed
+
+    if ($ProductKey) { exit (Invoke-OfficeProductKeyActivation -OsppPath $ospp -ProductKey $ProductKey) }
+    if ($KmsHost) { exit (Invoke-OfficeKmsActivation -OsppPath $ospp -KmsHost $KmsHost -KmsPort $KmsPort) }
+    if ($ActivateOnly) { exit (Invoke-OfficeOnlineActivation -OsppPath $ospp) }
+
+    if ($info -and $info.Licensed) {
+        Write-Host ""
+        Write-StatusLine 'OK' 'Активація не потрібна' 'Green'
+        exit 0
+    }
+
+    $exitCode = 0
+    while ($true) {
+        Write-Host ""
+        Write-Host "  Оберіть дію:" -ForegroundColor Yellow
+        Write-Host "    [1] Ввести ключ продукту (MAK / Retail)"
+        Write-Host "    [2] Активація через KMS"
+        Write-Host "    [3] Активувати зараз (ключ уже встановлено)"
+        Write-Host "    [0] Скасувати"
+        Write-Host ""
+        $choice = Read-Host "  Ваш вибір (0-3)"
+
+        switch ($choice) {
+            '0' { exit 0 }
+            '1' {
+                Write-Host ""
+                Write-Host "  Формат: XXXXX-XXXXX-XXXXX-XXXXX-XXXXX" -ForegroundColor Gray
+                $key = Read-Host "  Ключ продукту"
+                if ([string]::IsNullOrWhiteSpace($key)) { continue }
+                $exitCode = Invoke-OfficeProductKeyActivation -OsppPath $ospp -ProductKey $key
+                break
+            }
+            '2' {
+                Write-Host ""
+                $kmsServer = Read-Host "  Адреса KMS-сервера"
+                if ([string]::IsNullOrWhiteSpace($kmsServer)) { continue }
+                $portInput = Read-Host "  Порт KMS [1688]"
+                $port = 1688
+                if (-not [string]::IsNullOrWhiteSpace($portInput)) {
+                    if (-not [int]::TryParse($portInput, [ref]$port)) { continue }
+                }
+                $exitCode = Invoke-OfficeKmsActivation -OsppPath $ospp -KmsHost $kmsServer -KmsPort $port
+                break
+            }
+            '3' {
+                $exitCode = Invoke-OfficeOnlineActivation -OsppPath $ospp
+                break
+            }
+            default { Write-Host "  [!] Невірний вибір" -ForegroundColor Yellow; continue }
+        }
+        if ($choice -in @('1', '2', '3')) { break }
+    }
+
+    Write-Host ""
+    Write-Host "  Підсумок:" -ForegroundColor Yellow
+    Show-OfficeLicenseStatus -OsppPath $ospp -Detailed | Out-Null
+    exit $exitCode
+}
+
 function Invoke-VerifyOfficeInstall {
     param(
         [int]$SetupExitCode = 0,
@@ -1359,51 +1848,7 @@ function Invoke-VerifyOfficeInstall {
 
     Write-Host ""
     Write-Host "  Статус активації:" -ForegroundColor Yellow
-
-    $ospp = 'C:\Program Files\Microsoft Office\Office16\OSPP.VBS'
-    if (-not (Test-Path $ospp)) {
-        foreach ($root in $officeRoots) {
-            $candidate = Join-Path $root 'OSPP.VBS'
-            if (Test-Path $candidate) { $ospp = $candidate; break }
-        }
-    }
-
-    if (Test-Path $ospp) {
-        $job = Start-Job -ScriptBlock {
-            param($Path)
-            & cscript.exe //nologo $Path /dstatus 2>&1 | Out-String
-        } -ArgumentList $ospp
-
-        $completed = Wait-Job $job -Timeout 15
-        if ($completed) {
-            $statusRaw = Receive-Job $job
-            Remove-Job $job -Force
-
-            if ($statusRaw -match 'LICENSE STATUS:\s+([^\r\n]+)') {
-                $licenseStatus = $Matches[1].Trim()
-                if ($licenseStatus -eq '---LICENSED---') {
-                    Write-StatusLine "OK" "Office активовано" "Green"
-                } elseif ($licenseStatus -eq '---UNLICENSED---') {
-                    Write-StatusLine "!" "Office НЕ активовано — введіть ключ продукту" "Yellow"
-                } elseif ($licenseStatus -eq '---NOTIFICATIONS---') {
-                    Write-StatusLine "!" "Office потребує активації — введіть ключ продукту" "Yellow"
-                    if ($statusRaw -match 'Last 5 characters of installed product key:\s+(\S+)') {
-                        Write-Host "    (останні 5 символів ключа: $($Matches[1]))"
-                    }
-                } else {
-                    Write-StatusLine "?" "Статус ліцензії: $licenseStatus" "Yellow"
-                }
-            } else {
-                Write-StatusLine "?" "Не вдалося визначити статус ліцензії" "Yellow"
-            }
-        } else {
-            Stop-Job $job -Force
-            Remove-Job $job -Force
-            Write-StatusLine "?" "Перевірка активації занадто довга — перевірте в Word/Excel" "Yellow"
-        }
-    } else {
-        Write-StatusLine "?" "OSPP.VBS не знайдено" "Yellow"
-    }
+    $null = Show-OfficeLicenseStatus -Detailed
 
     Write-Host ""
     Write-Host "  Ярлики в Меню Пуск:" -ForegroundColor Yellow
@@ -2775,5 +3220,8 @@ switch ($Command) {
     }
     'RemoveTeamsSkype' {
         Invoke-RemoveTeamsSkype -InstallDir $InstallDir
+    }
+    'Activate' {
+        Invoke-ActivateOffice
     }
 }

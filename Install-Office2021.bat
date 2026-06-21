@@ -10,6 +10,7 @@ if /I "%~1"=="/uninstall" set "ACTION=uninstall"
 if /I "%~1"=="/download" set "ACTION=download"
 if /I "%~1"=="/downloadodt" set "ACTION=downloadodt"
 if /I "%~1"=="/removeteamsskype" set "ACTION=removeteamsskype"
+if /I "%~1"=="/activate" set "ACTION=activate"
 
 net session >nul 2>&1
 if %errorLevel% neq 0 (
@@ -48,6 +49,7 @@ if /I "%ACTION%"=="uninstall" set "ACTION=" & goto :action_uninstall
 if /I "%ACTION%"=="download" set "ACTION=" & goto :action_download
 if /I "%ACTION%"=="downloadodt" set "ACTION=" & goto :action_download_odt
 if /I "%ACTION%"=="removeteamsskype" set "ACTION=" & goto :action_remove_teams_skype
+if /I "%ACTION%"=="activate" set "ACTION=" & goto :action_activate
 goto :menu
 
 :header
@@ -96,11 +98,13 @@ echo.
 echo    --- Обслуговування ---
 echo    [5] Перевірити стан Office
 echo    [6] Повністю видалити Office з системи
-echo    [7] Перевірити / видалити Skype та Teams
+echo    [7] Перевірити / видалити Skype та Teams
+echo    [8] Активувати Office ^(ключ або KMS^)
 echo.
 echo    [0] Вихід
 echo.
-choice /C 01234567 /N /M "  Ваш вибір (0-7): "
+choice /C 012345678 /N /M "  Ваш вибір (0-8): "
+if errorlevel 9 goto :action_activate
 if errorlevel 8 goto :action_remove_teams_skype
 if errorlevel 7 goto :action_uninstall
 if errorlevel 6 goto :action_status
@@ -419,6 +423,36 @@ if %TS_CODE% equ 0 (
 call :ask_menu_or_exit
 goto :menu
 
+:action_activate
+call :header
+echo  [8] Активація Office
+call :prompt_back
+if errorlevel 1 goto :menu
+echo.
+call :load_office_info
+if not defined EXISTING_OFFICE (
+    echo  [X] Office не встановлено — спочатку пункт [3]
+    goto :error
+)
+echo  [OK] Знайдено: !EXISTING_OFFICE!
+echo       Версія: v!OFFICE_VERSION!  !OFFICE_PLATFORM!
+echo.
+echo  Потрібен легальний ключ продукту або KMS-сервер організації.
+echo.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\Office-Installer.ps1" -Command Activate
+set "VERIFY_CODE=%ERRORLEVEL%"
+echo.
+if %VERIFY_CODE% equ 0 (
+    echo  ============================================================
+    echo    ГОТОВО - Office активовано
+    echo  ============================================================
+) else (
+    echo  ============================================================
+    echo    Активація не завершена - перевірте ключ або KMS
+    echo  ============================================================
+)
+call :ask_menu_or_exit
+goto :menu
 :check_existing_office
 call :load_office_info
 if defined EXISTING_OFFICE (
