@@ -453,26 +453,23 @@ exit /b 0
 
 :do_install
 echo.
-echo  [Крок 3/4] Підготовка конфігурації...
 if "%REINSTALL%"=="1" (
-    powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\Office-Installer.ps1" -Command PrepareConfig -InstallDir "%ROOT_DIR%" -Mode Reinstall
-    echo  [OK] Режим: перевстановлення
+    echo  [Крок 3-4/4] Перевстановлення Office...
+    echo    A - видалення поточної версії
+    echo    B - встановлення з офлайн-файлів
+    echo    Прогрес відображається у цьому вікні.
 ) else (
-    powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\Office-Installer.ps1" -Command PrepareConfig -InstallDir "%ROOT_DIR%" -Mode Install
-    echo  [OK] Режим: встановлення
-)
-echo.
-echo  [Крок 4/4] Встановлення Office...
-if "%REINSTALL%"=="1" (
-    echo    Крок A - видалення поточної версії...
-    echo    Крок B - встановлення з офлайн-файлів...
-) else (
-    echo    Відкриється вікно інсталятора Microsoft Office.
+    echo  [Крок 3-4/4] Встановлення Office...
+    echo    Тихий режим Microsoft - прогрес у цьому вікні.
 )
 echo    Початок: %TIME%
 echo    --------------------------------------------------------
 call :check_setup_running
-"%ROOT_DIR%\setup.exe" /configure "%ROOT_DIR%\configuration-install.xml"
+if "%REINSTALL%"=="1" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\Office-Installer.ps1" -Command Install -InstallDir "%ROOT_DIR%" -Mode Reinstall
+) else (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\Office-Installer.ps1" -Command Install -InstallDir "%ROOT_DIR%" -Mode Install
+)
 set "EXIT_CODE=%ERRORLEVEL%"
 echo    --------------------------------------------------------
 echo    Завершено: %TIME%  ^(код: %EXIT_CODE%^)

@@ -6,6 +6,9 @@
   <!-- Очікуваний розмір офлайн-пакету (байти) для розрахунку відсотків -->
   <DownloadProfile ExpectedBytes="2200000000" />
 
+  <!-- Офлайн-встановлення: None = без вікна (рекомендовано без інтернету), Full = з UI -->
+  <InstallProfile DisplayLevel="None" />
+
   <!-- configuration — базова конфігурація Office 2021 Pro Plus -->
   <Configuration id="configuration">
     <Add OfficeClientEdition="64" Channel="PerpetualVL2021">
@@ -32,14 +35,15 @@
 
   <!-- configuration-install — зразок (реальний файл генерується скриптом) -->
   <Configuration id="configuration-install">
-    <Add OfficeClientEdition="64" Channel="PerpetualVL2021">
+    <Add OfficeClientEdition="64" Channel="PerpetualVL2021" AllowCdnFallback="False">
       <Product ID="ProPlus2021Volume">
         <Language ID="uk-ua" />
         <ExcludeApp ID="Lync" />
         <ExcludeApp ID="Teams" />
       </Product>
     </Add>
-    <Display Level="Full" AcceptEULA="TRUE" />
+    <Updates Enabled="FALSE" />
+    <Display Level="None" AcceptEULA="TRUE" />
   </Configuration>
 
   <!-- configuration-remove.xml — повне видалення Office -->

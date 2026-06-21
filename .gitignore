@@ -8,6 +8,9 @@ Office/
 configuration*.xml
 !configurations.xml
 
+# Логи setup.exe
+Logs/
+
 # Windows
 Thumbs.db
 Desktop.ini
